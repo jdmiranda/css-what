@@ -11,6 +11,16 @@ import {
 const reName = /^[^#\\]?(?:\\(?:[\da-f]{1,6}\s?|.)|[\w\u00B0-\uFFFF-])+/;
 const reEscape = /\\([\da-f]{1,6}\s?|(\s)|.)/gi;
 
+// Simple selector regex patterns (pre-compiled for performance)
+const reSimpleId = /^#([\w-]+)$/;
+const reSimpleClass = /^\.([\w-]+)$/;
+const reSimpleTag = /^([\w-]+)$/;
+const reSimpleUniversal = /^\*$/;
+
+// Cache for parsed selectors (LRU cache with max size)
+const MAX_CACHE_SIZE = 500;
+const selectorCache = new Map<string, Selector[][]>();
+
 const enum CharCode {
     LeftParenthesis = 40,
     RightParenthesis = 41,
@@ -45,6 +55,15 @@ const enum CharCode {
     FormFeed = 12,
     CarriageReturn = 13,
 }
+
+// Whitespace lookup table for O(1) checks
+const whitespaceChars = new Set([
+    CharCode.Space,
+    CharCode.Tab,
+    CharCode.NewLine,
+    CharCode.FormFeed,
+    CharCode.CarriageReturn,
+]);
 
 const actionTypes = new Map<number, AttributeAction>([
     [CharCode.Tilde, AttributeAction.Element],
@@ -130,13 +149,74 @@ function isQuote(c: number): boolean {
 }
 
 function isWhitespace(c: number): boolean {
-    return (
-        c === CharCode.Space ||
-        c === CharCode.Tab ||
-        c === CharCode.NewLine ||
-        c === CharCode.FormFeed ||
-        c === CharCode.CarriageReturn
-    );
+    return whitespaceChars.has(c);
+}
+
+/**
+ * Fast path for simple selectors (single class, id, tag, or universal)
+ */
+function tryParseFastPath(selector: string): Selector[][] | null {
+    // Check for simple ID selector
+    let match = reSimpleId.exec(selector);
+    if (match) {
+        return [
+            [
+                {
+                    type: SelectorType.Attribute,
+                    name: "id",
+                    action: AttributeAction.Equals,
+                    value: match[1],
+                    namespace: null,
+                    ignoreCase: "quirks",
+                },
+            ],
+        ];
+    }
+
+    // Check for simple class selector
+    match = reSimpleClass.exec(selector);
+    if (match) {
+        return [
+            [
+                {
+                    type: SelectorType.Attribute,
+                    name: "class",
+                    action: AttributeAction.Element,
+                    value: match[1],
+                    namespace: null,
+                    ignoreCase: "quirks",
+                },
+            ],
+        ];
+    }
+
+    // Check for simple tag selector
+    match = reSimpleTag.exec(selector);
+    if (match) {
+        return [
+            [
+                {
+                    type: SelectorType.Tag,
+                    name: match[1],
+                    namespace: null,
+                },
+            ],
+        ];
+    }
+
+    // Check for universal selector
+    if (reSimpleUniversal.test(selector)) {
+        return [
+            [
+                {
+                    type: SelectorType.Universal,
+                    namespace: null,
+                },
+            ],
+        ];
+    }
+
+    return null;
 }
 
 /**
@@ -148,6 +228,32 @@ function isWhitespace(c: number): boolean {
  * the second contains the relevant tokens for that selector.
  */
 export function parse(selector: string): Selector[][] {
+    // Check cache first
+    const cached = selectorCache.get(selector);
+    if (cached !== undefined) {
+        // Return a deep copy to prevent mutation of cached data
+        return cached.map((subselector) =>
+            subselector.map((token) => ({ ...token })),
+        );
+    }
+
+    // Try fast path for simple selectors
+    const fastPath = tryParseFastPath(selector);
+    if (fastPath !== null) {
+        // Store in cache
+        if (selectorCache.size >= MAX_CACHE_SIZE) {
+            // Simple LRU: remove oldest entry (first key)
+            const firstKey = selectorCache.keys().next().value;
+            if (firstKey !== undefined) {
+                selectorCache.delete(firstKey);
+            }
+        }
+        selectorCache.set(selector, fastPath);
+        return fastPath.map((subselector) =>
+            subselector.map((token) => ({ ...token })),
+        );
+    }
+
     const subselects: Selector[][] = [];
 
     const endIndex = parseSelector(subselects, `${selector}`, 0);
@@ -155,6 +261,16 @@ export function parse(selector: string): Selector[][] {
     if (endIndex < selector.length) {
         throw new Error(`Unmatched selector: ${selector.slice(endIndex)}`);
     }
+
+    // Store in cache
+    if (selectorCache.size >= MAX_CACHE_SIZE) {
+        // Simple LRU: remove oldest entry (first key)
+        const firstKey = selectorCache.keys().next().value;
+        if (firstKey !== undefined) {
+            selectorCache.delete(firstKey);
+        }
+    }
+    selectorCache.set(selector, subselects);
 
     return subselects;
 }
